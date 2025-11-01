@@ -1,0 +1,197 @@
+//controller function for registration 
+//using bcrypt to encrypt password
+import userModel from '../models/userModel.js';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken'
+import razorpay from 'razorpay'
+import transactionModel from '../models/transactionModel.js';
+
+
+const registerUser = async (req, res) => {
+    try {
+        const { name, email, password } = req.body;
+
+        if (!name || !email || !password) {
+            return res.json({ success: false, message: 'Missing details' })
+        }
+
+        //adding 10 means moderate encryption, if we increase the value then the encryption level also increases.
+        const salt = await bcrypt.genSalt(10)
+        const hashedPassword = await bcrypt.hash(password, salt)
+
+        //create an object where users data is stored in the database 
+        //does not include creditbalance as it already has a default value assigned to it 
+        const userData = {
+            name,
+            email,
+            password: hashedPassword
+        }
+
+        //saving user data in mongoDB database by attaching it to the userModel. does not include credit balance for above states reasons 
+        const newUser = new userModel(userData)
+        const user = await newUser.save()
+
+        //gen a token using the user id generated and our secret message created in .env file that sends a response that enables registration and login in the frontend
+        const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET) //user._id is auto generated in mongodb for every user and it is unique
+
+        //sending token as a response
+        res.json({ success: true, token, user: { name: user.name } })
+
+    } catch (error) {
+        console.log(error)
+        res.json({ success: false, message: error.message })
+    }
+}
+
+//controller function for user login
+const loginUser = async (req, res) => {
+    try {
+        //obtaining email and password from the req body as only these two are needed for user to login 
+        const { email, password } = req.body;
+
+        //finding the user using the unique email id and usermodel created 
+        const user = await userModel.findOne({ email })
+
+        //checking if that user exists
+        if (!user) {
+            return res.json({ success: false, message: 'User does not exist' })
+        }
+
+        //matching passwords if user exists
+        const isMatch = await bcrypt.compare(password, user.password)
+
+        if (isMatch) {
+            //generating token
+            const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET) //user._id is auto generated in mongodb for every user and it is unique
+
+            //sending token as a response
+            res.json({ success: true, token, user: { name: user.name } })
+        } else {
+            return res.json({ success: false, message: 'invalid credentials' })
+        }
+
+    } catch (error) {
+        console.log(error)
+        res.json({ success: false, message: error.message })
+    }
+}
+
+//returns credit balance of the user. need to add token in request header
+const userCredits = async (req, res) => {
+    try {
+        const { userId } = req.body //we will provide it using a middleware
+
+        const user = await userModel.findById(userId)
+        res.json({ success: true, credits: user.creditBalance, user: { name: user.name } })
+
+    } catch (error) {
+        console.log(error)
+        res.json({ success: false, message: error.message })
+    }
+}
+
+
+const razorpayInstance = new razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
+
+//controller func for payment gateway
+const paymentRazorpay = async (req, res) => {
+    try {
+        const { userId, planId } = req.body
+        const userData = await userModel.findById(userId)
+
+        if (!userId || !planId) {
+            return res.json({ success: false, message: "missing details" })
+        }
+
+        let credits, plan, amount, date
+
+        switch (planId) {
+            case 'Basic':
+                plan = 'Basic'
+                credits = 100
+                amount = 10
+                break;
+
+            case 'Advanced':
+                plan = 'Advanced'
+                credits = 500
+                amount = 50
+                break;
+
+            case 'Business':
+                plan = 'Business'
+                credits = 5000
+                amount = 250
+                break;
+
+            default:
+                return res.json({ success: false, message: 'plan not found' });
+        }
+
+        date = Date.now();
+
+        const transactionData = {
+            userId, plan, amount, credits, date
+        }
+
+        const newTransaction = await transactionModel.create(transactionData)
+        const options = {
+            amount: amount * 100,
+            currency: process.env.CURRENCY,
+            receipt: newTransaction._id, //auto generated by mongodb
+        }
+
+
+
+        await razorpayInstance.orders.create(options, (error, order) => {
+            if (error) {
+                console.log(error);
+                return res.json({ success: false, message: error })
+            }
+
+            res.json({ success: true, order })
+        })
+
+    } catch (error) {
+        console.log(error)
+        res.json({ success: false, message: error.message })
+    }
+
+}
+
+
+//verifying payment
+const verifyRazorpay = async (req, res) => {
+    try {
+        const { razorpay_order_id } = req.body;
+        const orderInfo = await razorpayInstance.orders.fetch(razorpay_order_id)
+
+        if (orderInfo.status === 'paid') {
+            const transactionData = await transactionModel.findById(orderInfo.receipt)
+
+            if (transactionData.payment) {
+                return res.json({ success: false, message: 'payment failed' })
+            }
+
+            const userData = await userModel.findById(transactionData.userId)
+            const creditBalance = userData.creditBalance + transactionData.credits
+            await userModel.findByIdAndUpdate(userData._id, { creditBalance })
+
+            await transactionModel.findByIdAndUpdate(transactionData._id, { payment: true })
+
+            res.json({ success: true, message: "credits added" })
+        } else {
+            res.json({ success: false, message: "payment failed" })
+        }
+
+
+    } catch (error) {
+        console.log(error);
+        res.json({ success: false, message: error.message })
+    }
+}
+
+export { registerUser, loginUser, userCredits, paymentRazorpay, verifyRazorpay }
